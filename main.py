@@ -8,6 +8,7 @@ from io import BytesIO
 import tensorflow as tf
 import os
 import logging
+import json
 from typing import Dict
 
 # Configure logging
@@ -35,22 +36,24 @@ s3 = boto3.client(
 
 # Update these paths to match your S3 structure
 BUCKET_NAME = 'virtual-herbal-garden-3d-models'
-MODEL_PATH = 'trained_models/model.json'
-LABEL_ENCODER_PATH = 'trained_models/plant_label_encoder.joblib'
+MODEL_DIR = 'trained_models'
+MODEL_JSON = f'{MODEL_DIR}/model.json'
+MODEL_WEIGHTS = f'{MODEL_DIR}/group1-shard1of3.bin'  # First shard of weights
+LABEL_ENCODER_PATH = f'{MODEL_DIR}/plant_label_encoder.joblib'
 
 # Global variables for model and label encoder
 model = None
 label_encoder = None
 
-def check_s3_files_exist():
-    """Check if required files exist in S3"""
+def download_s3_file(key: str, local_path: str):
+    """Download a file from S3 to a local path"""
     try:
-        # Check if model exists
-        s3.head_object(Bucket=BUCKET_NAME, Key=MODEL_PATH)
-        s3.head_object(Bucket=BUCKET_NAME, Key=LABEL_ENCODER_PATH)
+        logger.info(f"Downloading {key} from S3...")
+        s3.download_file(BUCKET_NAME, key, local_path)
+        logger.info(f"Successfully downloaded {key}")
         return True
     except Exception as e:
-        logger.error(f"Error checking S3 files: {str(e)}")
+        logger.error(f"Error downloading {key}: {str(e)}")
         return False
 
 def load_model_from_s3():
@@ -60,18 +63,32 @@ def load_model_from_s3():
         logger.info("Creating temporary directory...")
         os.makedirs('/tmp', exist_ok=True)
         
-        # Download and load the model
-        model_path = '/tmp/model.json'
+        # Download model JSON
+        model_json_path = '/tmp/model.json'
+        if not download_s3_file(MODEL_JSON, model_json_path):
+            raise Exception("Failed to download model JSON")
+            
+        # Download all weight shards
+        weight_files = ['group1-shard1of3.bin', 'group1-shard2of3.bin', 'group1-shard3of3.bin']
+        weight_paths = []
+        for weight_file in weight_files:
+            weight_path = f'/tmp/{weight_file}'
+            if not download_s3_file(f'{MODEL_DIR}/{weight_file}', weight_path):
+                raise Exception(f"Failed to download weight file {weight_file}")
+            weight_paths.append(weight_path)
+        
+        # Load the model from JSON
+        logger.info("Loading model architecture from JSON...")
+        with open(model_json_path, 'r') as f:
+            model_json = json.load(f)
+            
+        # Create model from JSON
+        model = tf.keras.models.model_from_json(json.dumps(model_json))
+        
+        # Download label encoder
         label_encoder_path = '/tmp/label_encoder.joblib'
-        
-        logger.info(f"Downloading model from S3... {BUCKET_NAME}/{MODEL_PATH}")
-        s3.download_file(BUCKET_NAME, MODEL_PATH, model_path)
-        
-        logger.info("Loading model...")
-        model = tf.keras.models.load_model(model_path)
-        
-        logger.info(f"Downloading label encoder... {BUCKET_NAME}/{LABEL_ENCODER_PATH}")
-        s3.download_file(BUCKET_NAME, LABEL_ENCODER_PATH, label_encoder_path)
+        if not download_s3_file(LABEL_ENCODER_PATH, label_encoder_path):
+            raise Exception("Failed to download label encoder")
         
         logger.info("Loading label encoder...")
         label_encoder = joblib.load(label_encoder_path)
@@ -79,9 +96,10 @@ def load_model_from_s3():
         logger.info("Model and label encoder loaded successfully")
         
         # Clean up temporary files
-        os.remove(model_path)
-        os.remove(label_encoder_path)
-        
+        for file_path in [model_json_path, label_encoder_path] + weight_paths:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
         logger.error(f"AWS Region: {os.environ.get('AWS_REGION')}")
