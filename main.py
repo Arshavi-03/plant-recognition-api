@@ -33,32 +33,59 @@ s3 = boto3.client(
     region_name=os.environ.get('AWS_REGION')
 )
 
+# Update these paths to match your S3 structure
 BUCKET_NAME = 'virtual-herbal-garden-3d-models'
-MODEL_PATH = 'plant_recognition_model_best.h5'
-LABEL_ENCODER_PATH = 'plant_label_encoder.joblib'
+MODEL_PATH = 'trained_models/model.json'
+LABEL_ENCODER_PATH = 'trained_models/plant_label_encoder.joblib'
 
 # Global variables for model and label encoder
 model = None
 label_encoder = None
 
+def check_s3_files_exist():
+    """Check if required files exist in S3"""
+    try:
+        # Check if model exists
+        s3.head_object(Bucket=BUCKET_NAME, Key=MODEL_PATH)
+        s3.head_object(Bucket=BUCKET_NAME, Key=LABEL_ENCODER_PATH)
+        return True
+    except Exception as e:
+        logger.error(f"Error checking S3 files: {str(e)}")
+        return False
+
 def load_model_from_s3():
     global model, label_encoder
+    
     try:
+        logger.info("Creating temporary directory...")
+        os.makedirs('/tmp', exist_ok=True)
+        
         # Download and load the model
-        model_obj = s3.get_object(Bucket=BUCKET_NAME, Key=MODEL_PATH)
-        model_bytes = model_obj['Body'].read()
+        model_path = '/tmp/model.json'
+        label_encoder_path = '/tmp/label_encoder.joblib'
         
-        with open('/tmp/model.h5', 'wb') as f:
-            f.write(model_bytes)
-        model = tf.keras.models.load_model('/tmp/model.h5')
+        logger.info(f"Downloading model from S3... {BUCKET_NAME}/{MODEL_PATH}")
+        s3.download_file(BUCKET_NAME, MODEL_PATH, model_path)
         
-        # Download and load the label encoder
-        le_obj = s3.get_object(Bucket=BUCKET_NAME, Key=LABEL_ENCODER_PATH)
-        label_encoder = joblib.load(BytesIO(le_obj['Body'].read()))
+        logger.info("Loading model...")
+        model = tf.keras.models.load_model(model_path)
+        
+        logger.info(f"Downloading label encoder... {BUCKET_NAME}/{LABEL_ENCODER_PATH}")
+        s3.download_file(BUCKET_NAME, LABEL_ENCODER_PATH, label_encoder_path)
+        
+        logger.info("Loading label encoder...")
+        label_encoder = joblib.load(label_encoder_path)
         
         logger.info("Model and label encoder loaded successfully")
+        
+        # Clean up temporary files
+        os.remove(model_path)
+        os.remove(label_encoder_path)
+        
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
+        logger.error(f"AWS Region: {os.environ.get('AWS_REGION')}")
+        logger.error(f"Bucket: {BUCKET_NAME}")
         raise
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
@@ -78,11 +105,42 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
 
 @app.on_event("startup")
 async def startup_event():
-    load_model_from_s3()
+    try:
+        logger.info("Starting application...")
+        logger.info("Checking AWS credentials...")
+        logger.info(f"AWS Region: {os.environ.get('AWS_REGION')}")
+        logger.info(f"Bucket: {BUCKET_NAME}")
+        load_model_from_s3()
+    except Exception as e:
+        logger.error(f"Startup failed: {str(e)}")
+        raise
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
+@app.get("/test-s3")
+async def test_s3():
+    """Endpoint to test S3 connectivity and list files"""
+    try:
+        # List objects in the trained_models directory
+        response = s3.list_objects_v2(
+            Bucket=BUCKET_NAME,
+            Prefix='trained_models/'
+        )
+        files = [obj['Key'] for obj in response.get('Contents', [])]
+        return {
+            "status": "success",
+            "message": "S3 connection successful",
+            "files": files
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "aws_region": os.environ.get('AWS_REGION'),
+            "bucket": BUCKET_NAME
+        }
 
 @app.post("/api/recognize-plant")
 async def recognize_plant(file: UploadFile = File(...)) -> Dict:
