@@ -6,12 +6,10 @@ import boto3
 import joblib
 from io import BytesIO
 import tensorflow as tf
-import tensorflowjs as tfjs
 import os
 import logging
 from typing import Dict
 import json
-import shutil
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -53,70 +51,57 @@ MODEL_FILES = {
 model = None
 label_encoder = None
 
-def setup_model_directory():
-    """Setup the model directory structure"""
-    model_dir = '/tmp/model'
-    if os.path.exists(model_dir):
-        shutil.rmtree(model_dir)
-    os.makedirs(model_dir, exist_ok=True)
-    return model_dir
-
-def download_model_files():
-    """Download all model files from S3"""
-    model_dir = setup_model_directory()
+def create_keras_model():
+    """Create a Keras model similar to your trained model"""
+    inputs = tf.keras.Input(shape=(224, 224, 3))
     
-    try:
-        # Download model.json
-        logger.info("Downloading model.json...")
-        model_json_path = os.path.join(model_dir, 'model.json')
-        s3.download_file(BUCKET_NAME, MODEL_FILES['json'], model_json_path)
-        
-        # Download weight files
-        for weight_file in MODEL_FILES['weights']:
-            filename = os.path.basename(weight_file)
-            logger.info(f"Downloading {filename}...")
-            s3.download_file(
-                BUCKET_NAME,
-                weight_file,
-                os.path.join(model_dir, filename)
-            )
-        
-        # Download label encoder
-        logger.info("Downloading label encoder...")
-        s3.download_file(
-            BUCKET_NAME,
-            MODEL_FILES['label_encoder'],
-            '/tmp/label_encoder.joblib'
-        )
-        
-        return model_dir
-    except Exception as e:
-        logger.error(f"Error downloading files: {str(e)}")
-        raise
+    # Use MobileNetV2 as base model
+    base_model = tf.keras.applications.MobileNetV2(
+        input_shape=(224, 224, 3),
+        include_top=False,
+        weights=None
+    )
+    
+    x = base_model(inputs)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense(4, activation='softmax')(x)  # 4 classes for your plants
+    
+    return tf.keras.Model(inputs=inputs, outputs=x)
+
+def download_and_load_weights():
+    """Download weights and load them into model"""
+    weight_data = []
+    
+    for weight_file in MODEL_FILES['weights']:
+        logger.info(f"Downloading {weight_file}...")
+        response = s3.get_object(Bucket=BUCKET_NAME, Key=weight_file)
+        weight_data.append(np.frombuffer(response['Body'].read(), dtype=np.float32))
+    
+    return np.concatenate(weight_data)
 
 def load_model_from_s3():
     """Load the model and label encoder"""
     global model, label_encoder
     
     try:
-        # Download files
-        model_dir = download_model_files()
+        # Create model
+        logger.info("Creating model architecture...")
+        model = create_keras_model()
         
-        # Load model using tensorflowjs
-        logger.info("Loading model with tensorflowjs...")
-        model = tfjs.converters.load_keras_model(
-            os.path.join(model_dir, 'model.json'),
-            use_unique_name_scope=True
-        )
+        # Download and load weights
+        logger.info("Loading model weights...")
+        weights = download_and_load_weights()
+        model.set_weights([weights])
         
-        # Load label encoder
+        # Download and load label encoder
         logger.info("Loading label encoder...")
-        label_encoder = joblib.load('/tmp/label_encoder.joblib')
+        response = s3.get_object(Bucket=BUCKET_NAME, Key=MODEL_FILES['label_encoder'])
+        label_encoder = joblib.load(BytesIO(response['Body'].read()))
         
         logger.info("Model and label encoder loaded successfully")
         
-        # Quick test of model loading
-        logger.info("Testing model loading...")
+        # Quick test
+        logger.info("Testing model...")
         test_input = np.zeros((1, 224, 224, 3))
         _ = model.predict(test_input)
         logger.info("Model test successful")
