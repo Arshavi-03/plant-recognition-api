@@ -8,8 +8,9 @@ from io import BytesIO
 import tensorflow as tf
 import os
 import logging
-import json
 from typing import Dict
+import json
+import tensorflowjs as tfjs
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -38,68 +39,60 @@ s3 = boto3.client(
 BUCKET_NAME = 'virtual-herbal-garden-3d-models'
 MODEL_DIR = 'trained_models'
 MODEL_JSON = f'{MODEL_DIR}/model.json'
-MODEL_WEIGHTS = f'{MODEL_DIR}/group1-shard1of3.bin'  # First shard of weights
 LABEL_ENCODER_PATH = f'{MODEL_DIR}/plant_label_encoder.joblib'
 
 # Global variables for model and label encoder
 model = None
 label_encoder = None
 
-def download_s3_file(key: str, local_path: str):
-    """Download a file from S3 to a local path"""
-    try:
-        logger.info(f"Downloading {key} from S3...")
-        s3.download_file(BUCKET_NAME, key, local_path)
-        logger.info(f"Successfully downloaded {key}")
-        return True
-    except Exception as e:
-        logger.error(f"Error downloading {key}: {str(e)}")
-        return False
+def download_and_save_files():
+    """Download all necessary files from S3"""
+    os.makedirs('/tmp/model', exist_ok=True)
+    
+    # Download model.json
+    logger.info("Downloading model.json...")
+    s3.download_file(BUCKET_NAME, MODEL_JSON, '/tmp/model/model.json')
+    
+    # Download shard files
+    shard_files = [
+        'group1-shard1of3.bin',
+        'group1-shard2of3.bin',
+        'group1-shard3of3.bin'
+    ]
+    
+    for shard in shard_files:
+        logger.info(f"Downloading {shard}...")
+        s3.download_file(
+            BUCKET_NAME, 
+            f'{MODEL_DIR}/{shard}', 
+            f'/tmp/model/{shard}'
+        )
+    
+    # Download label encoder
+    logger.info("Downloading label encoder...")
+    s3.download_file(
+        BUCKET_NAME,
+        LABEL_ENCODER_PATH,
+        '/tmp/label_encoder.joblib'
+    )
 
 def load_model_from_s3():
     global model, label_encoder
     
     try:
-        logger.info("Creating temporary directory...")
-        os.makedirs('/tmp', exist_ok=True)
+        # Download all files
+        download_and_save_files()
         
-        # Download model JSON
-        model_json_path = '/tmp/model.json'
-        if not download_s3_file(MODEL_JSON, model_json_path):
-            raise Exception("Failed to download model JSON")
-            
-        # Download all weight shards
-        weight_files = ['group1-shard1of3.bin', 'group1-shard2of3.bin', 'group1-shard3of3.bin']
-        weight_paths = []
-        for weight_file in weight_files:
-            weight_path = f'/tmp/{weight_file}'
-            if not download_s3_file(f'{MODEL_DIR}/{weight_file}', weight_path):
-                raise Exception(f"Failed to download weight file {weight_file}")
-            weight_paths.append(weight_path)
+        # Load the model using tensorflowjs
+        logger.info("Loading model with tensorflowjs...")
+        model = tfjs.converters.load_keras_model('/tmp/model/model.json')
         
-        # Load the model from JSON
-        logger.info("Loading model architecture from JSON...")
-        with open(model_json_path, 'r') as f:
-            model_json = json.load(f)
-            
-        # Create model from JSON
-        model = tf.keras.models.model_from_json(json.dumps(model_json))
-        
-        # Download label encoder
-        label_encoder_path = '/tmp/label_encoder.joblib'
-        if not download_s3_file(LABEL_ENCODER_PATH, label_encoder_path):
-            raise Exception("Failed to download label encoder")
-        
+        # Load label encoder
         logger.info("Loading label encoder...")
-        label_encoder = joblib.load(label_encoder_path)
+        label_encoder = joblib.load('/tmp/label_encoder.joblib')
         
         logger.info("Model and label encoder loaded successfully")
         
-        # Clean up temporary files
-        for file_path in [model_json_path, label_encoder_path] + weight_paths:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
         logger.error(f"AWS Region: {os.environ.get('AWS_REGION')}")
