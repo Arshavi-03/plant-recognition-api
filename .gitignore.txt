@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.env.local
+.venv/
+venv/
+.idea/
+.vscode/
+*.h5
+*.joblib
