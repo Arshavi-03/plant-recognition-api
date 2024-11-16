@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import numpy as np
 import boto3
-import joblib
+import pickle
 from io import BytesIO
 import tensorflow as tf
 import os
@@ -41,6 +41,7 @@ LABEL_ENCODER_PATH = 'deployment_model/label_encoder.joblib'
 # Global variables
 model = None
 label_encoder = None
+CLASSES = ['Amla', 'Ashwagandha', 'Neem', 'Tulsi']  # Add your actual class names here
 
 def create_model():
     """Create the model architecture"""
@@ -57,9 +58,18 @@ def create_model():
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
     x = tf.keras.layers.Dense(64, activation='relu')(x)
     x = tf.keras.layers.Dropout(0.5)(x)
-    outputs = tf.keras.layers.Dense(4, activation='softmax')(x)
+    outputs = tf.keras.layers.Dense(len(CLASSES), activation='softmax')(x)
     
     return tf.keras.Model(inputs=inputs, outputs=outputs)
+
+class SimpleEncoder:
+    """Simple label encoder replacement"""
+    def __init__(self, classes):
+        self.classes_ = classes
+        self.class_to_idx = {c: i for i, c in enumerate(classes)}
+    
+    def inverse_transform(self, indices):
+        return [self.classes_[i] for i in indices]
 
 def load_model_from_s3():
     """Load the model and label encoder from S3"""
@@ -74,18 +84,12 @@ def load_model_from_s3():
         model_path = '/tmp/model.h5'
         s3.download_file(BUCKET_NAME, MODEL_PATH, model_path)
         
-        # Download label encoder
-        logger.info("Downloading label encoder...")
-        le_path = '/tmp/label_encoder.joblib'
-        s3.download_file(BUCKET_NAME, LABEL_ENCODER_PATH, le_path)
-        
-        # Load model
-        logger.info("Loading model...")
-        
-        # Create model instance with architecture
+        # Create model with architecture
+        logger.info("Creating model architecture...")
         model = create_model()
         
         # Load weights
+        logger.info("Loading model weights...")
         model.load_weights(model_path)
         
         # Compile model
@@ -95,9 +99,9 @@ def load_model_from_s3():
             metrics=['accuracy']
         )
         
-        # Load label encoder
-        logger.info("Loading label encoder...")
-        label_encoder = joblib.load(le_path)
+        # Use simple encoder instead of joblib
+        logger.info("Setting up label encoder...")
+        label_encoder = SimpleEncoder(CLASSES)
         
         # Verify model works
         logger.info("Testing model...")
@@ -107,7 +111,6 @@ def load_model_from_s3():
         
         # Clean up
         os.remove(model_path)
-        os.remove(le_path)
         
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
@@ -146,7 +149,7 @@ async def health_check():
         "status": "healthy",
         "model_loaded": model is not None,
         "label_encoder_loaded": label_encoder is not None,
-        "model_architecture": str(model.layers) if model else None
+        "available_classes": CLASSES
     }
 
 @app.post("/api/recognize-plant")
@@ -172,14 +175,14 @@ async def recognize_plant(file: UploadFile = File(...)) -> Dict:
         # Get all class probabilities
         class_probs = {
             name: float(prob)
-            for name, prob in zip(label_encoder.classes_, predictions[0])
+            for name, prob in zip(CLASSES, predictions[0])
         }
         
         return {
             "plant": plant_name,
             "confidence": confidence,
             "probabilities": class_probs,
-            "prediction_time": "fast"  # Indicates this is using the optimized model
+            "prediction_time": "fast"
         }
     except Exception as e:
         logger.error(f"Error during prediction: {str(e)}")
