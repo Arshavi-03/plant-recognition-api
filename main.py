@@ -36,8 +36,8 @@ s3 = boto3.client(
 
 # S3 Configuration
 BUCKET_NAME = 'virtual-herbal-garden-3d-models'
-MODEL_PATH = 'deployment_model/plant_recognition_model_best.h5'
-LABEL_ENCODER_PATH = 'deployment_model/plant_label_encoder.joblib'
+MODEL_PATH = 'deployment_model/model.h5'
+LABEL_ENCODER_PATH = 'deployment_model/label_encoder.joblib'
 
 # Global variables
 model = None
@@ -48,32 +48,39 @@ def load_model_from_s3():
     global model, label_encoder
     
     try:
+        # Create temp directory
+        os.makedirs('/tmp', exist_ok=True)
+        
         # Download model file
         logger.info("Downloading model file...")
-        model_obj = s3.get_object(Bucket=BUCKET_NAME, Key=MODEL_PATH)
-        model_bytes = BytesIO(model_obj['Body'].read())
+        model_path = '/tmp/model.h5'
+        s3.download_file(BUCKET_NAME, MODEL_PATH, model_path)
         
         # Download label encoder
         logger.info("Downloading label encoder...")
-        le_obj = s3.get_object(Bucket=BUCKET_NAME, Key=LABEL_ENCODER_PATH)
-        le_bytes = BytesIO(le_obj['Body'].read())
+        le_path = '/tmp/label_encoder.joblib'
+        s3.download_file(BUCKET_NAME, LABEL_ENCODER_PATH, le_path)
         
-        # Save temporarily and load model
-        temp_model_path = '/tmp/model.h5'
-        with open(temp_model_path, 'wb') as f:
-            f.write(model_bytes.getvalue())
-        
+        # Load model
         logger.info("Loading model...")
-        model = load_model(temp_model_path)
+        model = load_model(model_path, compile=False)
+        
+        # Compile the model
+        model.compile(
+            optimizer='adam',
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
         
         # Load label encoder
         logger.info("Loading label encoder...")
-        label_encoder = joblib.load(le_bytes)
-        
-        # Clean up temporary file
-        os.remove(temp_model_path)
+        label_encoder = joblib.load(le_path)
         
         logger.info("Model and label encoder loaded successfully")
+        
+        # Clean up
+        os.remove(model_path)
+        os.remove(le_path)
         
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
@@ -122,7 +129,7 @@ async def recognize_plant(file: UploadFile = File(...)) -> Dict:
         processed_image = preprocess_image(image)
         
         # Make prediction
-        predictions = model.predict(processed_image)
+        predictions = model.predict(processed_image, verbose=0)
         predicted_class = np.argmax(predictions[0])
         confidence = float(predictions[0][predicted_class])
         
@@ -131,7 +138,7 @@ async def recognize_plant(file: UploadFile = File(...)) -> Dict:
         
         return {
             "plant": plant_name,
-            "confidence": float(confidence),
+            "confidence": confidence,
             "probabilities": {
                 plant: float(prob) 
                 for plant, prob in zip(label_encoder.classes_, predictions[0])
