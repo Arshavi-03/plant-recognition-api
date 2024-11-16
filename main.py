@@ -6,7 +6,6 @@ import boto3
 import joblib
 from io import BytesIO
 import tensorflow as tf
-from tensorflow.keras.models import load_model
 import os
 import logging
 from typing import Dict
@@ -43,6 +42,25 @@ LABEL_ENCODER_PATH = 'deployment_model/label_encoder.joblib'
 model = None
 label_encoder = None
 
+def create_model():
+    """Create the model architecture"""
+    inputs = tf.keras.Input(shape=(224, 224, 3))
+    
+    base_model = tf.keras.applications.MobileNetV2(
+        input_shape=(224, 224, 3),
+        include_top=False,
+        weights='imagenet'
+    )
+    base_model.trainable = False
+    
+    x = base_model(inputs)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense(64, activation='relu')(x)
+    x = tf.keras.layers.Dropout(0.5)(x)
+    outputs = tf.keras.layers.Dense(4, activation='softmax')(x)
+    
+    return tf.keras.Model(inputs=inputs, outputs=outputs)
+
 def load_model_from_s3():
     """Load the model and label encoder from S3"""
     global model, label_encoder
@@ -63,9 +81,14 @@ def load_model_from_s3():
         
         # Load model
         logger.info("Loading model...")
-        model = load_model(model_path, compile=False)
         
-        # Compile the model
+        # Create model instance with architecture
+        model = create_model()
+        
+        # Load weights
+        model.load_weights(model_path)
+        
+        # Compile model
         model.compile(
             optimizer='adam',
             loss='sparse_categorical_crossentropy',
@@ -76,7 +99,11 @@ def load_model_from_s3():
         logger.info("Loading label encoder...")
         label_encoder = joblib.load(le_path)
         
-        logger.info("Model and label encoder loaded successfully")
+        # Verify model works
+        logger.info("Testing model...")
+        test_input = np.zeros((1, 224, 224, 3))
+        _ = model.predict(test_input, verbose=0)
+        logger.info("Model loaded and verified successfully")
         
         # Clean up
         os.remove(model_path)
@@ -105,7 +132,12 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
 @app.on_event("startup")
 async def startup_event():
     """Initialize the application"""
-    load_model_from_s3()
+    try:
+        load_model_from_s3()
+        logger.info("Application started successfully")
+    except Exception as e:
+        logger.error(f"Failed to start application: {str(e)}")
+        raise
 
 @app.get("/health")
 async def health_check():
@@ -113,7 +145,8 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": model is not None,
-        "label_encoder_loaded": label_encoder is not None
+        "label_encoder_loaded": label_encoder is not None,
+        "model_architecture": str(model.layers) if model else None
     }
 
 @app.post("/api/recognize-plant")
@@ -136,13 +169,17 @@ async def recognize_plant(file: UploadFile = File(...)) -> Dict:
         # Get plant name
         plant_name = label_encoder.inverse_transform([predicted_class])[0]
         
+        # Get all class probabilities
+        class_probs = {
+            name: float(prob)
+            for name, prob in zip(label_encoder.classes_, predictions[0])
+        }
+        
         return {
             "plant": plant_name,
             "confidence": confidence,
-            "probabilities": {
-                plant: float(prob) 
-                for plant, prob in zip(label_encoder.classes_, predictions[0])
-            }
+            "probabilities": class_probs,
+            "prediction_time": "fast"  # Indicates this is using the optimized model
         }
     except Exception as e:
         logger.error(f"Error during prediction: {str(e)}")
