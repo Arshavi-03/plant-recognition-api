@@ -1,5 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from PIL import Image
 import numpy as np
 import boto3
@@ -14,7 +15,11 @@ from typing import Dict
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+app = FastAPI(
+    title="Plant Recognition API",
+    description="API for recognizing medicinal plants",
+    version="1.0.0"
+)
 
 # Configure CORS
 app.add_middleware(
@@ -41,7 +46,7 @@ LABEL_ENCODER_PATH = 'deployment_model/label_encoder.joblib'
 # Global variables
 model = None
 label_encoder = None
-CLASSES = ['Amla', 'Ashwagandha', 'Neem', 'Tulsi']  # Add your actual class names here
+CLASSES = ['Amla', 'Ashwagandha', 'Neem', 'Tulsi']
 
 def create_model():
     """Create the model architecture"""
@@ -99,7 +104,7 @@ def load_model_from_s3():
             metrics=['accuracy']
         )
         
-        # Use simple encoder instead of joblib
+        # Use simple encoder
         logger.info("Setting up label encoder...")
         label_encoder = SimpleEncoder(CLASSES)
         
@@ -142,6 +147,19 @@ async def startup_event():
         logger.error(f"Failed to start application: {str(e)}")
         raise
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "status": "online",
+        "service": "Plant Recognition API",
+        "endpoints": {
+            "health": "/health",
+            "recognize": "/api/recognize-plant"
+        },
+        "supported_plants": CLASSES
+    }
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -149,12 +167,24 @@ async def health_check():
         "status": "healthy",
         "model_loaded": model is not None,
         "label_encoder_loaded": label_encoder is not None,
-        "available_classes": CLASSES
+        "available_classes": CLASSES,
+        "environment": {
+            "aws_region": os.environ.get('AWS_REGION'),
+            "bucket": BUCKET_NAME
+        }
     }
 
 @app.post("/api/recognize-plant")
 async def recognize_plant(file: UploadFile = File(...)) -> Dict:
-    """Recognize plant from uploaded image"""
+    """
+    Recognize plant from uploaded image
+    
+    Returns:
+        Dict containing:
+        - plant: recognized plant name
+        - confidence: confidence score (0-1)
+        - probabilities: probability scores for all classes
+    """
     if not model or not label_encoder:
         raise HTTPException(status_code=500, detail="Model not loaded")
     
@@ -187,6 +217,18 @@ async def recognize_plant(file: UploadFile = File(...)) -> Dict:
     except Exception as e:
         logger.error(f"Error during prediction: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler"""
+    logger.error(f"Global error: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": str(exc),
+            "type": type(exc).__name__
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
