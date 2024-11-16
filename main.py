@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import numpy as np
@@ -6,10 +6,10 @@ import boto3
 import joblib
 from io import BytesIO
 import tensorflow as tf
+from tensorflow.keras.models import load_model
 import os
 import logging
 from typing import Dict
-import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,87 +34,54 @@ s3 = boto3.client(
     region_name=os.environ.get('AWS_REGION')
 )
 
-# Configure exact file paths as in your S3 bucket
+# S3 Configuration
 BUCKET_NAME = 'virtual-herbal-garden-3d-models'
-MODEL_DIR = 'trained_models'
-MODEL_FILES = {
-    'json': f'{MODEL_DIR}/model.json',
-    'weights': [
-        f'{MODEL_DIR}/group1-shard1of3.bin',
-        f'{MODEL_DIR}/group1-shard2of3.bin',
-        f'{MODEL_DIR}/group1-shard3of3.bin'
-    ],
-    'label_encoder': f'{MODEL_DIR}/plant_label_encoder.joblib'
-}
+MODEL_PATH = 'deployment_model/plant_recognition_model_best.h5'
+LABEL_ENCODER_PATH = 'deployment_model/plant_label_encoder.joblib'
 
-# Global variables for model and label encoder
+# Global variables
 model = None
 label_encoder = None
 
-def create_keras_model():
-    """Create a Keras model similar to your trained model"""
-    inputs = tf.keras.Input(shape=(224, 224, 3))
-    
-    # Use MobileNetV2 as base model
-    base_model = tf.keras.applications.MobileNetV2(
-        input_shape=(224, 224, 3),
-        include_top=False,
-        weights=None
-    )
-    
-    x = base_model(inputs)
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    x = tf.keras.layers.Dense(4, activation='softmax')(x)  # 4 classes for your plants
-    
-    return tf.keras.Model(inputs=inputs, outputs=x)
-
-def download_and_load_weights():
-    """Download weights and load them into model"""
-    weight_data = []
-    
-    for weight_file in MODEL_FILES['weights']:
-        logger.info(f"Downloading {weight_file}...")
-        response = s3.get_object(Bucket=BUCKET_NAME, Key=weight_file)
-        weight_data.append(np.frombuffer(response['Body'].read(), dtype=np.float32))
-    
-    return np.concatenate(weight_data)
-
 def load_model_from_s3():
-    """Load the model and label encoder"""
+    """Load the model and label encoder from S3"""
     global model, label_encoder
     
     try:
-        # Create model
-        logger.info("Creating model architecture...")
-        model = create_keras_model()
+        # Download model file
+        logger.info("Downloading model file...")
+        model_obj = s3.get_object(Bucket=BUCKET_NAME, Key=MODEL_PATH)
+        model_bytes = BytesIO(model_obj['Body'].read())
         
-        # Download and load weights
-        logger.info("Loading model weights...")
-        weights = download_and_load_weights()
-        model.set_weights([weights])
+        # Download label encoder
+        logger.info("Downloading label encoder...")
+        le_obj = s3.get_object(Bucket=BUCKET_NAME, Key=LABEL_ENCODER_PATH)
+        le_bytes = BytesIO(le_obj['Body'].read())
         
-        # Download and load label encoder
+        # Save temporarily and load model
+        temp_model_path = '/tmp/model.h5'
+        with open(temp_model_path, 'wb') as f:
+            f.write(model_bytes.getvalue())
+        
+        logger.info("Loading model...")
+        model = load_model(temp_model_path)
+        
+        # Load label encoder
         logger.info("Loading label encoder...")
-        response = s3.get_object(Bucket=BUCKET_NAME, Key=MODEL_FILES['label_encoder'])
-        label_encoder = joblib.load(BytesIO(response['Body'].read()))
+        label_encoder = joblib.load(le_bytes)
+        
+        # Clean up temporary file
+        os.remove(temp_model_path)
         
         logger.info("Model and label encoder loaded successfully")
         
-        # Quick test
-        logger.info("Testing model...")
-        test_input = np.zeros((1, 224, 224, 3))
-        _ = model.predict(test_input)
-        logger.info("Model test successful")
-        
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
-        logger.error(f"AWS Region: {os.environ.get('AWS_REGION')}")
-        logger.error(f"Bucket: {BUCKET_NAME}")
         raise
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
     """Preprocess the image for model input"""
-    # Resize image to match training input size
+    # Resize image
     image = image.resize((224, 224))
     
     # Convert to RGB if necessary
@@ -131,46 +98,23 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
 @app.on_event("startup")
 async def startup_event():
     """Initialize the application"""
-    try:
-        logger.info("Starting application...")
-        logger.info("Checking AWS credentials...")
-        logger.info(f"AWS Region: {os.environ.get('AWS_REGION')}")
-        logger.info(f"Bucket: {BUCKET_NAME}")
-        load_model_from_s3()
-    except Exception as e:
-        logger.error(f"Startup failed: {str(e)}")
-        raise
+    load_model_from_s3()
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy"}
-
-@app.get("/test-s3")
-async def test_s3():
-    """Test S3 connectivity and list files"""
-    try:
-        response = s3.list_objects_v2(
-            Bucket=BUCKET_NAME,
-            Prefix='trained_models/'
-        )
-        files = [obj['Key'] for obj in response.get('Contents', [])]
-        return {
-            "status": "success",
-            "message": "S3 connection successful",
-            "files": files
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e),
-            "aws_region": os.environ.get('AWS_REGION'),
-            "bucket": BUCKET_NAME
-        }
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "label_encoder_loaded": label_encoder is not None
+    }
 
 @app.post("/api/recognize-plant")
 async def recognize_plant(file: UploadFile = File(...)) -> Dict:
     """Recognize plant from uploaded image"""
+    if not model or not label_encoder:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+    
     try:
         # Read and preprocess the image
         contents = await file.read()
@@ -182,16 +126,20 @@ async def recognize_plant(file: UploadFile = File(...)) -> Dict:
         predicted_class = np.argmax(predictions[0])
         confidence = float(predictions[0][predicted_class])
         
-        # Get plant name from label encoder
+        # Get plant name
         plant_name = label_encoder.inverse_transform([predicted_class])[0]
         
         return {
             "plant": plant_name,
-            "confidence": confidence
+            "confidence": float(confidence),
+            "probabilities": {
+                plant: float(prob) 
+                for plant, prob in zip(label_encoder.classes_, predictions[0])
+            }
         }
     except Exception as e:
         logger.error(f"Error during prediction: {str(e)}")
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
